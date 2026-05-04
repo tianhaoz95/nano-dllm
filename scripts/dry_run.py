@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Dry-run: verify the BD3LM + MiCA training pipeline works end-to-end on GPU.
+Dry-run: verify the BD3LM + MiCA + WSD pipeline works end-to-end on GPU.
 
 Usage (tsp required per project conventions):
     source .venv/bin/activate
@@ -25,7 +25,7 @@ sys.path.insert(0, REPO_ROOT)
 
 from dllm.pipelines.a2d import A2DQwen3Config, A2DQwen3LMHeadModel  # noqa: E402
 from dllm.core.trainers.bd3lm import BD3LMConfig, BD3LMTrainer       # noqa: E402
-from mica import apply_mica                                            # noqa: E402
+from mica import apply_mica, WSDBlockSizeScheduler, WSDBlockSizeCallback  # noqa: E402
 
 MODEL_PATH   = os.path.join(REPO_ROOT, "models", "Qwen3-0.6B")
 OUTPUT_DIR   = os.path.join(REPO_ROOT, "outputs", "dry_run")
@@ -33,7 +33,7 @@ BLOCK_SIZE   = 32
 SEQ_LEN      = 64   # multiple of BLOCK_SIZE
 NUM_TRAIN    = 16
 NUM_EVAL     = 4
-MAX_STEPS    = 5
+MAX_STEPS    = 8    # enough to cross 2 WSD phase boundaries (4 steps per phase × 2)
 MICA_RANK    = 16
 MICA_ALPHA   = 16.0
 MICA_TARGETS = ["q_proj", "v_proj"]
@@ -57,10 +57,32 @@ def count_params(model):
     return total, trainable
 
 
+def _build_model(tokenizer):
+    src_cfg  = transformers.AutoConfig.from_pretrained(MODEL_PATH)
+    cfg_dict = {k: v for k, v in src_cfg.to_dict().items()
+                if k not in ("model_type", "architectures")}
+    a2d_cfg  = A2DQwen3Config(**cfg_dict)
+    src_model = transformers.AutoModelForCausalLM.from_pretrained(
+        MODEL_PATH, torch_dtype=torch.bfloat16, device_map="cpu"
+    )
+    model = A2DQwen3LMHeadModel(a2d_cfg).to(dtype=torch.bfloat16)
+    model.load_state_dict(src_model.state_dict(), strict=False)
+    del src_model
+    model.resize_token_embeddings(len(tokenizer))
+    model.config._attn_implementation = "sdpa"
+    return model
+
+
+def section(title: str):
+    print(f"\n{'─' * 60}")
+    print(f"  {title}")
+    print(f"{'─' * 60}")
+
+
 def main():
     t0 = time.time()
     print("=" * 60)
-    print("  BD3LM + MiCA Dry-Run Verification")
+    print("  BD3LM + MiCA + WSD Dry-Run Verification")
     print("=" * 60)
 
     if not torch.cuda.is_available():
@@ -71,66 +93,57 @@ def main():
 
     transformers.set_seed(42)
 
-    # ── 1. Tokenizer ─────────────────────────────────────────────────
-    print("\n[1/5] Loading tokenizer ...")
+    # ── 1. Tokenizer ─────────────────────────────────────────────────────
+    section("1 / 6  Tokenizer")
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         MODEL_PATH, padding_side="right"
     )
     if not tokenizer.pad_token:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.add_special_tokens({"mask_token": "<|mask|>"})
-    print(f"      vocab size    : {len(tokenizer)}")
-    print(f"      mask_token_id : {tokenizer.mask_token_id}")
+    print(f"  vocab size    : {len(tokenizer)}")
+    print(f"  mask_token_id : {tokenizer.mask_token_id}")
 
-    # ── 2. Model (Qwen3-0.6B → A2DQwen3) ─────────────────────────────
-    print("\n[2/5] Building A2DQwen3 model ...")
-    src_cfg  = transformers.AutoConfig.from_pretrained(MODEL_PATH)
-    cfg_dict = {k: v for k, v in src_cfg.to_dict().items()
-                if k not in ("model_type", "architectures")}
-    a2d_cfg  = A2DQwen3Config(**cfg_dict)
+    # ── 2. WSD scheduler unit test ────────────────────────────────────────
+    section("2 / 6  WSD Scheduler Unit Test")
+    sched = WSDBlockSizeScheduler.dry_run()   # 4 phases × 2 steps each
+    print(f"  {sched}")
+    expected = [(0, 1), (1, 1), (2, 4), (3, 4), (4, 64), (5, 64), (6, 32), (7, 32)]
+    for step, exp_bs in expected:
+        got = sched.get_block_size(step)
+        assert got == exp_bs, f"step={step}: expected block_size={exp_bs}, got={got}"
+    print(f"  All {len(expected)} step→block_size mappings correct ✓")
 
-    print("      copying weights from Qwen3-0.6B (CPU) ...")
-    src_model = transformers.AutoModelForCausalLM.from_pretrained(
-        MODEL_PATH, torch_dtype=torch.bfloat16, device_map="cpu"
-    )
-    model = A2DQwen3LMHeadModel(a2d_cfg).to(dtype=torch.bfloat16)
-    model.load_state_dict(src_model.state_dict(), strict=False)
-    del src_model
-
-    model.resize_token_embeddings(len(tokenizer))
-    model.config._attn_implementation = "sdpa"
-
-    # ── 3. Apply MiCA ─────────────────────────────────────────────────
-    print(f"\n[3/5] Applying MiCA (rank={MICA_RANK}, alpha={MICA_ALPHA}) ...")
-    print(f"      targets       : {MICA_TARGETS}")
+    # ── 3. Model + MiCA ──────────────────────────────────────────────────
+    section("3 / 6  Model + MiCA")
+    print("  Building A2DQwen3 model ...")
+    model = _build_model(tokenizer)
 
     t_svd = time.time()
     apply_mica(model, target_modules=MICA_TARGETS, rank=MICA_RANK, alpha=MICA_ALPHA)
-    print(f"      SVD time      : {time.time() - t_svd:.1f}s")
+    print(f"  MiCA SVD time : {time.time() - t_svd:.1f}s")
 
     total, trainable = count_params(model)
-    print(f"      total params  : {total:,}")
-    print(f"      trainable     : {trainable:,}  ({100 * trainable / total:.3f}%)")
+    print(f"  total params  : {total:,}")
+    print(f"  trainable     : {trainable:,}  ({100 * trainable / total:.3f}%)")
 
-    # Sanity check: ΔW must be exactly 0 at init because A is zero-initialised
     for name, m in model.named_modules():
         if hasattr(m, "A") and hasattr(m, "B"):
-            delta_max = (m.scaling * m.B @ m.A).abs().max().item()
-            assert delta_max == 0.0, f"Non-zero delta at init in {name}: {delta_max}"
-    print("      init check    : ΔW = 0 for all MiCA layers ✓")
+            assert (m.scaling * m.B @ m.A).abs().max().item() == 0.0
+    print("  init check    : ΔW = 0 for all MiCA layers ✓")
 
     model = model.cuda()
-    print(f"      device        : {next(model.parameters()).device}")
+    print(f"  device        : {next(model.parameters()).device}")
 
-    # ── 4. Datasets ───────────────────────────────────────────────────
-    print("\n[4/5] Building synthetic datasets ...")
+    # ── 4. Datasets ───────────────────────────────────────────────────────
+    section("4 / 6  Datasets")
     train_ds = make_dummy_dataset(len(tokenizer), NUM_TRAIN, SEQ_LEN)
     eval_ds  = make_dummy_dataset(len(tokenizer), NUM_EVAL,  SEQ_LEN)
-    print(f"      train : {len(train_ds)} × {SEQ_LEN} tokens")
-    print(f"      eval  : {len(eval_ds)} × {SEQ_LEN} tokens")
+    print(f"  train : {len(train_ds)} × {SEQ_LEN} tokens")
+    print(f"  eval  : {len(eval_ds)} × {SEQ_LEN} tokens")
 
-    # ── 5. Train ──────────────────────────────────────────────────────
-    print(f"\n[5/5] Running BD3LMTrainer for {MAX_STEPS} steps ...")
+    # ── 5. Train with WSD ────────────────────────────────────────────────
+    section(f"5 / 6  BD3LMTrainer + WSD ({MAX_STEPS} steps, 4 phase transitions)")
     training_args = BD3LMConfig(
         output_dir                  = OUTPUT_DIR,
         overwrite_output_dir        = True,
@@ -146,25 +159,36 @@ def main():
         save_steps                  = MAX_STEPS,
         eval_on_start               = False,
         report_to                   = "none",
-        block_size                  = BLOCK_SIZE,
+        block_size                  = 1,   # WSD callback overrides this
         dataloader_num_workers      = 0,
     )
     collator = transformers.DataCollatorForSeq2Seq(
         tokenizer, return_tensors="pt", padding=True
     )
     trainer = BD3LMTrainer(
-        model          = model,
-        tokenizer      = tokenizer,
-        train_dataset  = train_ds,
-        eval_dataset   = eval_ds,
-        args           = training_args,
-        data_collator  = collator,
+        model            = model,
+        processing_class = tokenizer,
+        train_dataset    = train_ds,
+        eval_dataset     = eval_ds,
+        args             = training_args,
+        data_collator    = collator,
     )
+    wsd_cb = WSDBlockSizeCallback(trainer=trainer, scheduler=sched)
+    trainer.add_callback(wsd_cb)
+
     trainer.train()
+
+    # ── 6. Verify WSD callback fired correctly ────────────────────────────
+    section("6 / 6  WSD callback verification")
+    # After 8 steps the last phase is decay_32 (block_size=32)
+    assert trainer.block_size == 32, (
+        f"Expected block_size=32 after {MAX_STEPS} steps, got {trainer.block_size}"
+    )
+    print(f"  trainer.block_size={trainer.block_size} after {MAX_STEPS} steps ✓")
 
     elapsed = time.time() - t0
     print("\n" + "=" * 60)
-    print(f"  PASSED — BD3LM + MiCA dry run finished in {elapsed:.1f}s")
+    print(f"  PASSED — BD3LM + MiCA + WSD dry run finished in {elapsed:.1f}s")
     print("=" * 60)
 
 
