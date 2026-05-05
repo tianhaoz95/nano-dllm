@@ -1,0 +1,60 @@
+# Virtual Environment
+.venv/
+bin/
+include/
+lib/
+lib64/
+share/
+pyvenv.cfg
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Large Data & Models
+models/
+outputs/
+*.safetensors
+*.bin
+*.pt
+*.pth
+
+# References & Documentation (PDFs)
+# refs/
+
+# Logs & Monitoring
+logs/
+wandb/
+*.log
+
+# IDEs & Tools
+.claude/
+.vscode/
+.idea/
+.DS_Store
+.ipynb_checkpoints/
+.cache/
+
+# System
+*.swp
+*~
