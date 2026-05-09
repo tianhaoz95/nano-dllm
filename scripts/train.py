@@ -37,8 +37,60 @@ import dllm
 from dllm.pipelines.a2d import A2DQwen3Config, A2DQwen3LMHeadModel
 from dllm.core.trainers.bd3lm import BD3LMConfig, BD3LMTrainer
 from mica import apply_mica, WSDBlockSizeScheduler, WSDBlockSizeCallback
+from scripts.benchmark_gsm8k import run_automated_benchmark
 
 logger = dllm.utils.get_default_logger(__name__)
+
+
+# ── Callbacks ─────────────────────────────────────────────────────────────────
+
+class GSMBenchmarkCallback(transformers.TrainerCallback):
+    """
+    Automated benchmark triggered after each model save.
+    Pauses training by moving model to CPU and clearing VRAM to run evaluations.
+    """
+    def __init__(self, mica_args):
+        self.mica_args = mica_args
+
+    def on_save(self, args, state, control, **kwargs):
+        # We only run benchmark if this is a save step and not the very start
+        if state.is_world_process_zero and state.global_step > 0:
+            checkpoint_dir = f"checkpoint-{state.global_step}"
+            checkpoint_path = os.path.join(args.output_dir, checkpoint_dir)
+            
+            logger.info(f"\n[GSMBench] Pausing training for benchmark at step {state.global_step}...")
+            
+            # 1. Clear VRAM: Move main model to CPU
+            model = kwargs["model"]
+            original_device = next(model.parameters()).device
+            model.to("cpu")
+            torch.cuda.empty_cache()
+            
+            try:
+                # 2. Run the 4-part benchmark (32 samples)
+                results = run_automated_benchmark(
+                    checkpoint_path=checkpoint_path,
+                    limit=32,
+                    rank=self.mica_args.mica_rank,
+                    alpha=self.mica_args.mica_alpha,
+                    device="cuda"
+                )
+                
+                # 3. Log to W&B
+                if "wandb" in args.report_to:
+                    import wandb
+                    if wandb.run is not None:
+                        wandb.log(results, step=state.global_step)
+                        logger.info(f"[GSMBench] Logged to W&B: {results}")
+            
+            except Exception as e:
+                logger.error(f"[GSMBench] Benchmark failed: {e}")
+            
+            finally:
+                # 4. Resume: Move model back to GPU
+                logger.info("[GSMBench] Resuming training...")
+                model.to(original_device)
+                torch.cuda.empty_cache()
 
 
 # ── Argument dataclasses ───────────────────────────────────────────────────────
@@ -277,6 +329,7 @@ def train():
         trainer.add_callback(
             WSDBlockSizeCallback(trainer=trainer, scheduler=wsd_scheduler)
         )
+        trainer.add_callback(GSMBenchmarkCallback(mica_args=mica_args))
 
     logger.info("Starting training ...")
     trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-GSM8K accuracy benchmark for MiCA-BD3LM trained checkpoint.
+GSM8K accuracy benchmark for MiCA-BD3LM.
+Supports multiple configurations and automated logging during training.
 """
 
 import argparse
@@ -27,14 +28,9 @@ from mica import apply_mica
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
-DEFAULT_CHECKPOINT = os.path.join(REPO_ROOT, "outputs", "run-mica-wsd-001", "checkpoint-final")
 DEFAULT_BASE_MODEL  = os.path.join(REPO_ROOT, "models", "Qwen3-0.6B")
-DEFAULT_OUTPUT      = os.path.join(REPO_ROOT, "results", "gsm8k_benchmark.md")
 
-MICA_RANK    = 16
-MICA_ALPHA   = 16.0
 MICA_TARGETS = ["q_proj", "v_proj"]
-
 NUM_FEWSHOT  = 5
 MAX_NEW_TOKENS = 512
 STOP_STRINGS = ["Question:", "</s>", "<|im_end|>"]
@@ -75,22 +71,28 @@ def build_fewshot_prompt(train_examples: list[dict], question: str) -> str:
 
 # ── Model loaders ──────────────────────────────────────────────────────────────
 
-def load_mica_model(checkpoint_path: str, rank: int, alpha: float, device: str):
+def load_mica_model(checkpoint_path: str, rank: int, alpha: float, device: str, zero_mica: bool = False):
     """Load A2DQwen3 + MiCA from a training checkpoint directory."""
     cfg = A2DQwen3Config.from_pretrained(checkpoint_path)
-    # FORCE qwen3 model_type to ensure causal mask logic is used during eval
     cfg.model_type = "qwen3"
     model = A2DQwen3LMHeadModel(cfg).to(dtype=torch.bfloat16)
     apply_mica(model, target_modules=MICA_TARGETS, rank=rank, alpha=alpha)
-    state = safetensors_load(
-        os.path.join(checkpoint_path, "model.safetensors"), device="cpu"
-    )
-    model.load_state_dict(state, strict=False)
+    
+    if not zero_mica:
+        state = safetensors_load(
+            os.path.join(checkpoint_path, "model.safetensors"), device="cpu"
+        )
+        model.load_state_dict(state, strict=False)
+    else:
+        # Zero out MiCA adapters explicitly
+        for m in model.modules():
+            if hasattr(m, "A") and hasattr(m, "B"):
+                torch.nn.init.zeros_(m.A)
+                torch.nn.init.zeros_(m.B)
+    
     model.tie_weights()
     model.config._attn_implementation = "sdpa"
     return model.to(device).eval()
-
-
 
 def load_base_model(model_path: str, device: str):
     """Load the base Qwen3-0.6B AR model for comparison."""
@@ -99,7 +101,6 @@ def load_base_model(model_path: str, device: str):
         attn_implementation="sdpa",
     )
     return model.eval()
-
 
 def load_tokenizer(path: str) -> transformers.PreTrainedTokenizer:
     tok = transformers.AutoTokenizer.from_pretrained(path, padding_side="left")
@@ -122,9 +123,7 @@ def evaluate(
 ) -> dict:
 
     strict_correct = 0
-    flex_correct   = 0
     total          = len(test_ds)
-    results        = []
 
     eos_token_ids = [
         tokenizer.eos_token_id,
@@ -132,7 +131,6 @@ def evaluate(
     ]
     eos_token_ids = list({x for x in eos_token_ids if x is not None and x >= 0})
 
-    import gc
     t0 = time.time()
     for batch_start in range(0, total, batch_size):
         batch = test_ds[batch_start : batch_start + batch_size]
@@ -151,239 +149,112 @@ def evaluate(
                 block_size=block_size,
                 return_dict=False
             )
-
             sampler = BD3LMSampler(model=model, tokenizer=tokenizer)
-            
             inputs_list = tokenizer(prompts)["input_ids"]
             outputs_seq = sampler.sample(inputs_list, sampler_config, right_shift_logits=True)
             
             generations = []
-
             for i, seq in enumerate(outputs_seq):
                 p_len = len(inputs_list[i])
                 padded_p_len = ((p_len + block_size - 1) // block_size) * block_size
                 gen_ids = seq[padded_p_len:]
-                
                 gen_text = tokenizer.decode(gen_ids, skip_special_tokens=True)
                 for stop_str in STOP_STRINGS:
                     if stop_str in gen_text:
                         gen_text = gen_text.split(stop_str)[0]
                 generations.append(gen_text)
-            
-            # Explicit cleanup
             del sampler
-            del outputs_seq
         else:
-            enc = tokenizer(
-                prompts,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=2048,
-            ).to(device)
-
+            enc = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=2048).to(device)
             with torch.no_grad():
                 out_ids = model.generate(
-                    **enc,
-                    max_new_tokens=MAX_NEW_TOKENS,
-                    do_sample=False,
-                    temperature=None,
-                    top_p=None,
-                    eos_token_id=eos_token_ids,
+                    **enc, max_new_tokens=MAX_NEW_TOKENS, do_sample=False,
+                    temperature=None, top_p=None, eos_token_id=eos_token_ids,
                     pad_token_id=tokenizer.pad_token_id,
                 )
-
             prompt_len = enc["input_ids"].shape[1]
             gen_ids    = out_ids[:, prompt_len:]
             generations = tokenizer.batch_decode(gen_ids, skip_special_tokens=True)
-            
-            # Explicit cleanup
-            del enc
-            del out_ids
 
-        for q, gold_raw, gold_num, gen in zip(questions, gold_answers_raw, gold_nums, generations):
-            strict_pred = extract_strict(gen)
-            flex_pred   = extract_flexible(gen)
-            s_ok = answers_match(strict_pred, gold_num or "")
-            f_ok = answers_match(flex_pred,   gold_num or "")
-            if s_ok:
+        for gold_num, gen in zip(gold_nums, generations):
+            if answers_match(extract_strict(gen), gold_num or ""):
                 strict_correct += 1
-            if f_ok:
-                flex_correct += 1
-            results.append({
-                "question": q,
-                "gold": gold_raw,
-                "gold_num": gold_num,
-                "generation": gen,
-                "strict_pred": strict_pred,
-                "flex_pred": flex_pred,
-                "strict_match": s_ok,
-                "flex_match": f_ok,
-            })
 
-        done = min(batch_start + batch_size, total)
-        elapsed = time.time() - t0
-        eta = elapsed / done * (total - done) if done else 0
-        print(
-            f"  [{label}] {done}/{total} "
-            f"strict={strict_correct/done:.3f}  flex={flex_correct/done:.3f}  "
-            f"ETA {eta/60:.1f}m",
-            end="\r",
-            flush=True,
-        )
-        
-        # GC and Cache clear every batch
-        gc.collect()
         torch.cuda.empty_cache()
 
-    print()
-
-    elapsed = time.time() - t0
     return {
         "label": label,
-        "n_examples": total,
         "strict_acc": strict_correct / total,
-        "flex_acc": flex_correct / total,
-        "strict_correct": strict_correct,
-        "flex_correct": flex_correct,
-        "elapsed_s": elapsed,
-        "results": results,
+        "elapsed_s": time.time() - t0,
     }
 
-# ── Markdown report ────────────────────────────────────────────────────────────
+# ── Main Benchmarking Function ────────────────────────────────────────────────
 
-def write_markdown(output_path: str, eval_results: list[dict], meta: dict):
-    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    lines = [
-        "# GSM8K Benchmark — MiCA-BD3LM",
-        "",
-        f"**Date**: {ts}  ",
-        f"**Checkpoint**: `{meta['checkpoint']}`  ",
-        f"**Base model**: `{meta['base_model']}`  ",
-        f"**Few-shot**: {NUM_FEWSHOT}  ",
-        f"**Test examples**: {eval_results[0]['n_examples']}  ",
-        f"**Decoding**: greedy (temperature=0)  ",
-        "",
-        "## Results",
-        "",
-        "| Model | Strict-Match ↑ | Flexible-Extract ↑ | Correct (strict) | Wall time |",
-        "|-------|---------------|-------------------|-----------------|-----------|",
-    ]
-
-    for r in eval_results:
-        lines.append(
-            f"| {r['label']} "
-            f"| {r['strict_acc']:.4f} ({r['strict_acc']*100:.2f}%) "
-            f"| {r['flex_acc']:.4f} ({r['flex_acc']*100:.2f}%) "
-            f"| {r['strict_correct']}/{r['n_examples']} "
-            f"| {r['elapsed_s']/60:.1f} min |"
-        )
-
-    lines += [
-        "",
-        "## Metric Definitions",
-        "",
-        "- **Strict-match**: generation contains `#### <number>` and the number matches gold (commas/$ stripped).",
-        "- **Flexible-extract**: last number found anywhere in the generation matches gold.",
-        "",
-        "**Total optimizer steps**: 4500 · MiCA rank=16 α=16 targets=q_proj,v_proj · BF16",
-    ]
-
-    with open(output_path, "w") as f:
-        f.write("\n".join(lines) + "\n")
-    print(f"\nReport written to {output_path}")
-
-# ── Main ───────────────────────────────────────────────────────────────────────
-
-def parse_args():
-    p = argparse.ArgumentParser(description="GSM8K Accuracy Benchmark for MiCA-BD3LM")
-    p.add_argument("--checkpoint",  default=DEFAULT_CHECKPOINT,
-                   help=f"Path to the MiCA-BD3LM checkpoint directory (default: {DEFAULT_CHECKPOINT})")
-    p.add_argument("--base_model",  default=DEFAULT_BASE_MODEL,
-                   help=f"Path to the base AR model directory for comparison (default: {DEFAULT_BASE_MODEL})")
-    p.add_argument("--output",      default=DEFAULT_OUTPUT,
-                   help=f"Path to save the results report (.md and .json) (default: {DEFAULT_OUTPUT})")
-    p.add_argument("--batch_size",  type=int, default=16,
-                   help="Batch size for evaluation (default: 16)")
-    p.add_argument("--block_size",  type=int, default=1,
-                   help="Block size for BD3LM sampler (default: 1)")
-    p.add_argument("--steps_per_block", type=int, default=None,
-                   help="Fixed steps per block (overrides total steps budget)")
-    p.add_argument("--skip_base",   action="store_true",
-                   help="Skip evaluating the base Qwen3-0.6B baseline")
-    p.add_argument("--limit",       type=int, default=None,
-                   help="Evaluate on first N examples only (for quick tests)")
-    p.add_argument("--rank",        type=int, default=MICA_RANK)
-    p.add_argument("--alpha",       type=float, default=MICA_ALPHA)
-    return p.parse_args()
-
-
-def main():
-    args = parse_args()
-
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA not available — a GPU is required.")
-    device = "cuda"
-    gpu = torch.cuda.get_device_properties(0)
-    print(f"GPU  : {gpu.name}")
-    print(f"VRAM : {gpu.total_memory / 1e9:.1f} GB")
-
-    print("\nLoading GSM8K ...")
+def run_automated_benchmark(
+    checkpoint_path: str,
+    base_model_path: str = DEFAULT_BASE_MODEL,
+    limit: int = 32,
+    rank: int = 32,
+    alpha: float = 32.0,
+    batch_size: int = 16,
+    device: str = "cuda",
+):
+    """
+    Runs the 4-part benchmark requested:
+    1. Base AR
+    2. Block Size 8 + Zero MiCA
+    3. Block Size 1 + Trained MiCA
+    4. Block Size 8 + Trained MiCA
+    """
+    print(f"\n[GSMBench] Starting automated benchmark for {checkpoint_path} (limit={limit})")
+    
     train_ds = load_dataset("gsm8k", "main", split="train")
-    test_ds  = load_dataset("gsm8k", "main", split="test")
+    test_ds  = load_dataset("gsm8k", "main", split="test").select(range(limit))
     fewshot_examples = list(train_ds.select(range(NUM_FEWSHOT)))
-    if args.limit:
-        test_ds = test_ds.select(range(args.limit))
-    print(f"  train (few-shot pool) : {len(train_ds)}")
-    print(f"  test                  : {len(test_ds)}")
+    
+    tokenizer = load_tokenizer(checkpoint_path)
+    results = {}
 
-    all_results = []
-
-    print(f"\nLoading MiCA-BD3LM checkpoint: {args.checkpoint}")
-    tokenizer = load_tokenizer(args.checkpoint)
-    mica_model = load_mica_model(args.checkpoint, args.rank, args.alpha, device)
-    total = sum(p.numel() for p in mica_model.parameters())
-    trainable = sum(p.numel() for p in mica_model.parameters() if p.requires_grad)
-    print(f"  params: {total:,}  trainable: {trainable:,} ({100*trainable/total:.3f}%)")
-    print(f"\nEvaluating MiCA-BD3LM (block_size={args.block_size}, steps_per_block={args.steps_per_block}) ...")
-    r = evaluate(mica_model, tokenizer, test_ds, fewshot_examples,
-                 args.batch_size, device, "MiCA-BD3LM (checkpoint-final)",
-                 block_size=args.block_size,
-                 steps_per_block=args.steps_per_block)
-
-    all_results.append(r)
-    del mica_model
+    # 1. Base AR
+    print("  Evaluating Configuration 1: Base AR ...")
+    model = load_base_model(base_model_path, device)
+    r = evaluate(model, tokenizer, test_ds, fewshot_examples, batch_size, device, "Base AR")
+    results["gsm8k/base_ar_acc"] = r["strict_acc"]
+    del model
     torch.cuda.empty_cache()
 
-    if not args.skip_base:
-        print(f"\nLoading base model: {args.base_model}")
-        base_tok = load_tokenizer(args.base_model)
-        base_model = load_base_model(args.base_model, device)
-        print("\nEvaluating base Qwen3-0.6B ...")
-        r_base = evaluate(base_model, base_tok, test_ds, fewshot_examples,
-                          args.batch_size, device, "Qwen3-0.6B (base AR)")
-        all_results.append(r_base)
-        del base_model
-        torch.cuda.empty_cache()
+    # 2. Block Size 8 + Zero MiCA
+    print("  Evaluating Configuration 2: BS=8 + Zero MiCA ...")
+    model = load_mica_model(checkpoint_path, rank, alpha, device, zero_mica=True)
+    r = evaluate(model, tokenizer, test_ds, fewshot_examples, batch_size, device, "BS8-ZeroMiCA", block_size=8)
+    results["gsm8k/bs8_zero_mica_acc"] = r["strict_acc"]
+    del model
+    torch.cuda.empty_cache()
 
-    json_path = args.output.replace(".md", ".json")
-    Path(json_path).parent.mkdir(parents=True, exist_ok=True)
-    with open(json_path, "w") as f:
-        json.dump(all_results, f, indent=2)
-    print(f"Detailed results JSON written to {json_path}")
-
-
-    meta = {"checkpoint": args.checkpoint, "base_model": args.base_model}
-    write_markdown(args.output, all_results, meta)
-
-    print("\n=== Final Results ===")
-    for r in all_results:
-        print(f"  {r['label']}")
-        print(f"    strict-match    : {r['strict_acc']*100:.2f}%")
-        print(f"    flexible-extract: {r['flex_acc']*100:.2f}%")
-
+    # 3. Block Size 1 + Trained MiCA
+    print("  Evaluating Configuration 3: BS=1 + Trained MiCA ...")
+    model = load_mica_model(checkpoint_path, rank, alpha, device, zero_mica=False)
+    r = evaluate(model, tokenizer, test_ds, fewshot_examples, batch_size, device, "BS1-TrainedMiCA", block_size=1)
+    results["gsm8k/bs1_trained_mica_acc"] = r["strict_acc"]
+    # Keep model for next config to save load time if possible, but here we change block size which is a sampler param
+    r = evaluate(model, tokenizer, test_ds, fewshot_examples, batch_size, device, "BS8-TrainedMiCA", block_size=8)
+    results["gsm8k/bs8_trained_mica_acc"] = r["strict_acc"]
+    
+    del model
+    torch.cuda.empty_cache()
+    
+    print(f"[GSMBench] Results: {results}")
+    return results
 
 if __name__ == "__main__":
-    main()
+    # Command line usage support
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--base_model", default=DEFAULT_BASE_MODEL)
+    parser.add_argument("--limit", type=int, default=32)
+    parser.add_argument("--rank", type=int, default=32)
+    parser.add_argument("--alpha", type=float, default=32.0)
+    args = parser.parse_args()
+    
+    res = run_automated_benchmark(args.checkpoint, args.base_model, args.limit, args.rank, args.alpha)
+    print(json.dumps(res, indent=2))
