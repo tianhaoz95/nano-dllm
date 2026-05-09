@@ -10,10 +10,12 @@ on:
       - '.github/workflows/deploy-docs.yml'
 
 permissions:
-  contents: write
+  contents: read
+  pages: write
+  id-token: write
 
 jobs:
-  deploy:
+  build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -30,6 +32,22 @@ jobs:
           python -m pip install --upgrade pip
           pip install mkdocs-material mkdocs-minify-plugin
 
-      - name: Build and deploy
+      - name: Build documentation
         run: |
-          mkdocs gh-deploy --force
+          mkdocs build
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./site
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
