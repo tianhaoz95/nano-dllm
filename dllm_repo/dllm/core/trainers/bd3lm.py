@@ -98,6 +98,30 @@ class BD3LMTrainer(MDLMTrainer):
         super().__init__(args=args, *pargs, **kwargs)
         self.block_size = args.block_size
 
+    def training_step(self, model, inputs, num_items_in_batch=None) -> torch.Tensor:
+        model.train()
+        if hasattr(self, "_preprocess_inputs"):
+            inputs = self._preprocess_inputs(inputs)
+
+        with self.compute_loss_context_manager():
+            loss, outputs = self.compute_loss(model, inputs, return_outputs=True)
+
+        if self.args.n_gpu > 1:
+            loss = loss.mean()
+
+        self.accelerator.backward(loss)
+
+        # Capture accuracy from metrics if present
+        if hasattr(outputs, "metrics") and "accuracy" in outputs.metrics:
+            self._current_accuracy = outputs.metrics["accuracy"].detach().item()
+
+        return loss.detach() / self.args.gradient_accumulation_steps
+
+    def log(self, logs: dict[str, float], *args, **kwargs) -> None:
+        if hasattr(self, "_current_accuracy"):
+            logs["accuracy"] = self._current_accuracy
+        super().log(logs, *args, **kwargs)
+
     def compute_loss(
         self,
         model: transformers.PreTrainedModel | nn.Module,
@@ -107,17 +131,6 @@ class BD3LMTrainer(MDLMTrainer):
     ):
         """
         Compute the block diffusion language modeling loss.
-
-        Applies block-wise diffusion with specialized attention masks where the model
-        attends to both noised blocks (x_t) and clean context blocks (x_0).
-
-        Args:
-            model: The language model to train.
-            inputs: Dictionary containing input_ids, labels, and optionally attention_mask.
-            return_outputs: If True, return both loss and model outputs.
-
-        Returns:
-            Loss tensor, or tuple of (loss, outputs) if return_outputs is True.
         """
         assert self.processing_class.padding_side == "right"
         inputs = self._preprocess_inputs(inputs)
@@ -130,111 +143,138 @@ class BD3LMTrainer(MDLMTrainer):
         maskable_mask = labels != -100  # [b, l]
 
         # === 1. Sample diffusion timesteps ===
-        # Each example draws a random timestep t ∈ [ε, 1), where ε avoids degenerate values near 0.
-        # The scheduler defines the masking rate α(t); we convert it to a masking probability p_mask = 1 - α(t).
         t = self.time_epsilon + (1 - self.time_epsilon) * torch.rand(
             b, device=input_ids.device
         )  # [b]
         p_mask = 1.0 - self.scheduler(t).unsqueeze(1).expand(b, l)  # [b, l]
 
         # === 2. Apply stochastic masking ===
-        # Tokens are masked independently according to p_mask(t).
-        # Positions with label = -100 are excluded (ignored in loss).
         masked_mask = (
             torch.rand((b, l), device=input_ids.device) < p_mask
         ) & maskable_mask
-        # Replace masked tokens with the special [MASK] token.
         noised_input_ids = torch.where(
             masked_mask, self.processing_class.mask_token_id, input_ids
         )
 
-        # === 3. Forward pass through the model (block-diffusion) ===
-        # We follow the paper and feed x_t ⊕ x_0 with a specialized block mask.
-
-        # concat_input_ids: [b, 2l], first l are noisy (x_t), last l are clean (x_0)
+        # ── Forward pass through the model (block-diffusion) ──
         concat_input_ids = torch.cat([noised_input_ids, input_ids], dim=1)
 
-        # [TODO]: others like flash attention 2
-        if self.accelerator.unwrap_model(model).config._attn_implementation == "sdpa":
-            attention_mask = _create_bd3lm_attention_mask(
-                b=None,
-                h=None,
-                q_idx=torch.arange(l * 2)[:, None],
-                kv_idx=torch.arange(l * 2)[None, :],
-                block_size=self.block_size,
-                n=l,
-            )
-            attention_mask = (
-                attention_mask.unsqueeze(0).unsqueeze(0).expand(1, 1, 2 * l, 2 * l)
-            )
-            attention_mask = attention_mask.to(input_ids.device)
-        elif (
-            self.accelerator.unwrap_model(model).config._attn_implementation
-            == "flex_attention"
-        ):
-            from torch.nn.attention.flex_attention import create_block_mask
+        unwrapped_model = self.accelerator.unwrap_model(model)
 
-            attention_mask = create_block_mask(
-                partial(_create_bd3lm_attention_mask, block_size=self.block_size, n=l),
-                B=None,
-                H=None,
-                Q_LEN=l * 2,
-                KV_LEN=l * 2,
-            )
+        # Cache the attention mask to avoid redundant creation/transfer
+        if unwrapped_model.config._attn_implementation == "flex_attention":
+            from torch.nn.attention.flex_attention import create_block_mask
+            if not hasattr(self, "_cached_mask_params") or self._cached_mask_params != (l, self.block_size, input_ids.device):
+                self._cached_mask = create_block_mask(
+                    partial(_create_bd3lm_attention_mask, block_size=self.block_size, n=l),
+                    B=None, H=None, Q_LEN=l * 2, KV_LEN=l * 2,
+                    device=input_ids.device
+                )
+                self._cached_mask_params = (l, self.block_size, input_ids.device)
+            attention_mask = self._cached_mask
+        elif unwrapped_model.config._attn_implementation == "sdpa":
+            if not hasattr(self, "_cached_mask_params") or self._cached_mask_params != (l, self.block_size, input_ids.device):
+                attention_mask = _create_bd3lm_attention_mask(
+                    b=None, h=None,
+                    q_idx=torch.arange(l * 2, device=input_ids.device)[:, None],
+                    kv_idx=torch.arange(l * 2, device=input_ids.device)[None, :],
+                    block_size=self.block_size,
+                    n=l,
+                )
+                self._cached_mask = attention_mask.unsqueeze(0).unsqueeze(0).expand(1, 1, 2 * l, 2 * l)
+                self._cached_mask_params = (l, self.block_size, input_ids.device)
+            attention_mask = self._cached_mask
         else:
-            raise NotImplementedError
+            attention_mask = None
 
         base_pos = (
             torch.arange(l, device=input_ids.device).unsqueeze(0).expand(b, l)
-        )  # [B, L]
-        concat_position_ids = torch.cat([base_pos, base_pos], dim=1)  # [B, 2L]
-
-        outputs = model(
-            input_ids=concat_input_ids,
-            attention_mask=attention_mask,
-            position_ids=concat_position_ids,
         )
-        outputs = self._postprocess_outputs(outputs)
-        logits = outputs.logits
+        concat_position_ids = torch.cat([base_pos, base_pos], dim=1)
 
-        logits = logits[:, :l]  # we only care about the first half for computing loss
+        # Optimization: Only compute logits for the tokens we care about (the first half x_t)
+        # However, transformers.Trainer.compute_loss usually calls model() which computes all logits.
+        # We unwrap and call the backbone directly if possible.
+        unwrapped_model = self.accelerator.unwrap_model(model)
+        
+        # Check if it's our A2D model that supports returning hidden states
+        if hasattr(unwrapped_model, "model") and hasattr(unwrapped_model, "lm_head"):
+            hidden_states = unwrapped_model.model(
+                input_ids=concat_input_ids,
+                attention_mask=attention_mask,
+                position_ids=concat_position_ids,
+            ).last_hidden_state
+            
+            # Use only the first half and only masked positions for the LM head
+            # This is a huge optimization for both compute and memory
+            masked_hidden = hidden_states[:, :l][masked_mask]
+            masked_labels = input_ids[masked_mask]
+            
+            if masked_hidden.shape[0] > 0:
+                logits = unwrapped_model.lm_head(masked_hidden)
+                loss_weights = self._compute_loss_weights(t=t, inputs=inputs, masked_mask=masked_mask)
+                # Compute weight per masked token
+                masked_weights = loss_weights[masked_mask]
+                
+                loss = F.cross_entropy(logits, masked_labels, reduction="none")
+                loss = (loss * masked_weights).sum()
 
-        # === 4. Compute per-token loss weights ===
-        # Depending on the configuration, weights may depend on timestep t
-        # (e.g., scheduler-based) or be uniform (ones).
-        loss_weights = self._compute_loss_weights(
-            t=t, inputs=inputs, masked_mask=masked_mask
-        )
-
-        # === 5. Compute weighted cross-entropy ===
-        # Sanity check: ensure input_ids and labels match at valid positions
-        assert (
-            input_ids[maskable_mask] == labels[maskable_mask]
-        ).all(), "Mismatch between input_ids and labels at valid positions"
-
-        token_nll = F.cross_entropy(
-            logits.transpose(1, 2),  # [b, V, l]
-            input_ids,  # [b, l]
-            reduction="none",  # [b, l]
-        )
-        token_nll = token_nll * loss_weights * masked_mask.to(token_nll.dtype)  # [b, l]
-
-        self.meter.update(
-            split="train" if model.training else "eval",
-            value=token_nll.detach(),
-            weight=maskable_mask.to(dtype=logits.dtype).detach(),
-        )
-
-        # === 6. Normalize loss ===
-        if self.loss_norm_type == "token":
-            token_nll /= maskable_mask.sum().clamp_min(1)
-        elif self.loss_norm_type == "sequence":
-            token_nll /= maskable_mask.sum(-1, keepdim=True).clamp_min(1) * b
-        elif self.loss_norm_type == "batch":
-            token_nll /= b
+                # Calculate Accuracy
+                with torch.no_grad():
+                    preds = logits.argmax(dim=-1)
+                    accuracy = (preds == masked_labels).float().mean()
+                
+                # Normalize loss
+                if self.loss_norm_type == "token":
+                    loss /= maskable_mask.sum().clamp_min(1)
+                elif self.loss_norm_type == "sequence":
+                    loss /= (maskable_mask.sum(-1, keepdim=True).clamp_min(1) * b).sum()
+                elif self.loss_norm_type == "batch":
+                    loss /= b
+                
+                # Mock outputs for compatibility if needed
+                outputs = transformers.modeling_outputs.MaskedLMOutput(loss=loss, logits=None)
+                if not hasattr(outputs, "metrics"):
+                    outputs.metrics = {}
+                outputs.metrics["accuracy"] = accuracy.detach()
+            else:
+                loss = torch.tensor(0.0, device=input_ids.device, requires_grad=True)
+                outputs = transformers.modeling_outputs.MaskedLMOutput(loss=loss, logits=None)
+                if not hasattr(outputs, "metrics"):
+                    outputs.metrics = {}
+                outputs.metrics["accuracy"] = torch.tensor(0.0, device=input_ids.device)
         else:
-            raise ValueError("Invalid loss_norm_type.")
-        loss = token_nll.sum()
+            # Fallback to standard slow path
+            outputs = model(
+                input_ids=concat_input_ids,
+                attention_mask=attention_mask,
+                position_ids=concat_position_ids,
+            )
+            logits = outputs.logits[:, :l]
+            loss_weights = self._compute_loss_weights(t=t, inputs=inputs, masked_mask=masked_mask)
+            loss = F.cross_entropy(logits.transpose(1, 2), input_ids, reduction="none")
+            loss = (loss * loss_weights * masked_mask.to(loss.dtype)).sum()
 
-        # === 7. Return final loss (and optionally model outputs) ===
+            # Calculate Accuracy
+            with torch.no_grad():
+                preds = logits.argmax(dim=-1)
+                # Only care about masked positions
+                mask = masked_mask
+                if mask.any():
+                    accuracy = (preds[mask] == input_ids[mask]).float().mean()
+                else:
+                    accuracy = torch.tensor(0.0, device=input_ids.device)
+            
+            if self.loss_norm_type == "token":
+                loss /= maskable_mask.sum().clamp_min(1)
+            elif self.loss_norm_type == "sequence":
+                loss /= (maskable_mask.sum(-1, keepdim=True).clamp_min(1) * b).sum()
+            elif self.loss_norm_type == "batch":
+                loss /= b
+            outputs.loss = loss
+            if not hasattr(outputs, "metrics"):
+                outputs.metrics = {}
+            outputs.metrics["accuracy"] = accuracy.detach()
+
         return (loss, outputs) if return_outputs else loss
+

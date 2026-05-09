@@ -31,13 +31,24 @@ share/python-wheels/
 *.egg
 MANIFEST
 
+# Environment & Secrets
+.env
+.env.*
+
 # Large Data & Models
-models/
-outputs/
+/datasets/
+/models/
+/outputs/
+/wandb/
+/logs/
 *.safetensors
 *.bin
 *.pt
 *.pth
+
+# Temporary
+/tmp/
+/temp/
 
 # References & Documentation (PDFs)
 # refs/

@@ -1,24 +1,6 @@
 #!/usr/bin/env python3
 """
 GSM8K accuracy benchmark for MiCA-BD3LM trained checkpoint.
-
-Evaluates the checkpoint-final model against the full GSM8K test set (1319
-examples) using 5-shot chain-of-thought prompting and greedy decoding.
-Also evaluates the base Qwen3-0.6B for comparison.
-
-Two metrics (matching lm-evaluation-harness gsm8k.yaml):
-  - strict-match : answer after "#### " matches exactly (ignoring commas/$)
-  - flexible-extract : last number found in generation matches
-
-Usage (tsp required per project conventions):
-    source .venv/bin/activate
-    tsp python scripts/benchmark_gsm8k.py
-
-    # Custom checkpoint:
-    tsp python scripts/benchmark_gsm8k.py \\
-        --checkpoint ./outputs/run-mica-wsd-001/checkpoint-final \\
-        --output    ./results/gsm8k_benchmark.md \\
-        --batch_size 16
 """
 
 import argparse
@@ -40,6 +22,7 @@ sys.path.insert(0, os.path.join(REPO_ROOT, "dllm_repo"))
 sys.path.insert(0, REPO_ROOT)
 
 from dllm.pipelines.a2d import A2DQwen3Config, A2DQwen3LMHeadModel
+from dllm.core.samplers import BD3LMSampler, BD3LMSamplerConfig
 from mica import apply_mica
 
 # ── Constants ──────────────────────────────────────────────────────────────────
@@ -92,21 +75,21 @@ def build_fewshot_prompt(train_examples: list[dict], question: str) -> str:
 
 # ── Model loaders ──────────────────────────────────────────────────────────────
 
-def load_mica_model(checkpoint_path: str, device: str):
+def load_mica_model(checkpoint_path: str, rank: int, alpha: float, device: str):
     """Load A2DQwen3 + MiCA from a training checkpoint directory."""
     cfg = A2DQwen3Config.from_pretrained(checkpoint_path)
+    # FORCE qwen3 model_type to ensure causal mask logic is used during eval
+    cfg.model_type = "qwen3"
     model = A2DQwen3LMHeadModel(cfg).to(dtype=torch.bfloat16)
-    apply_mica(model, target_modules=MICA_TARGETS, rank=MICA_RANK, alpha=MICA_ALPHA)
-    # Load checkpoint weights (MiCALinear keys: weight, B buffers + A parameter)
+    apply_mica(model, target_modules=MICA_TARGETS, rank=rank, alpha=alpha)
     state = safetensors_load(
         os.path.join(checkpoint_path, "model.safetensors"), device="cpu"
     )
-    # lm_head.weight is tied to embed_tokens.weight in Qwen3 — load non-strictly
-    # then re-tie so generation uses the correct embeddings.
     model.load_state_dict(state, strict=False)
     model.tie_weights()
     model.config._attn_implementation = "sdpa"
     return model.to(device).eval()
+
 
 
 def load_base_model(model_path: str, device: str):
@@ -134,7 +117,10 @@ def evaluate(
     batch_size: int,
     device: str,
     label: str,
+    block_size: int = 1,
+    steps_per_block: int = None,
 ) -> dict:
+
     strict_correct = 0
     flex_correct   = 0
     total          = len(test_ds)
@@ -146,6 +132,7 @@ def evaluate(
     ]
     eos_token_ids = list({x for x in eos_token_ids if x is not None and x >= 0})
 
+    import gc
     t0 = time.time()
     for batch_start in range(0, total, batch_size):
         batch = test_ds[batch_start : batch_start + batch_size]
@@ -155,29 +142,64 @@ def evaluate(
         prompts = [build_fewshot_prompt(fewshot_examples, q) for q in questions]
         gold_nums = [extract_strict(a) for a in gold_answers_raw]
 
-        enc = tokenizer(
-            prompts,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=2048,
-        ).to(device)
-
-        with torch.no_grad():
-            out_ids = model.generate(
-                **enc,
+        if getattr(model.config, "model_type", "") == "a2d-qwen3":
+            sampler_config = BD3LMSamplerConfig(
+                steps=128,
+                steps_per_block=steps_per_block,
                 max_new_tokens=MAX_NEW_TOKENS,
-                do_sample=False,
-                temperature=None,
-                top_p=None,
-                eos_token_id=eos_token_ids,
-                pad_token_id=tokenizer.pad_token_id,
+                temperature=0.0,
+                block_size=block_size,
+                return_dict=False
             )
 
-        # Decode only the newly generated tokens
-        prompt_len = enc["input_ids"].shape[1]
-        gen_ids    = out_ids[:, prompt_len:]
-        generations = tokenizer.batch_decode(gen_ids, skip_special_tokens=True)
+            sampler = BD3LMSampler(model=model, tokenizer=tokenizer)
+            
+            inputs_list = tokenizer(prompts)["input_ids"]
+            outputs_seq = sampler.sample(inputs_list, sampler_config, right_shift_logits=True)
+            
+            generations = []
+
+            for i, seq in enumerate(outputs_seq):
+                p_len = len(inputs_list[i])
+                padded_p_len = ((p_len + block_size - 1) // block_size) * block_size
+                gen_ids = seq[padded_p_len:]
+                
+                gen_text = tokenizer.decode(gen_ids, skip_special_tokens=True)
+                for stop_str in STOP_STRINGS:
+                    if stop_str in gen_text:
+                        gen_text = gen_text.split(stop_str)[0]
+                generations.append(gen_text)
+            
+            # Explicit cleanup
+            del sampler
+            del outputs_seq
+        else:
+            enc = tokenizer(
+                prompts,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=2048,
+            ).to(device)
+
+            with torch.no_grad():
+                out_ids = model.generate(
+                    **enc,
+                    max_new_tokens=MAX_NEW_TOKENS,
+                    do_sample=False,
+                    temperature=None,
+                    top_p=None,
+                    eos_token_id=eos_token_ids,
+                    pad_token_id=tokenizer.pad_token_id,
+                )
+
+            prompt_len = enc["input_ids"].shape[1]
+            gen_ids    = out_ids[:, prompt_len:]
+            generations = tokenizer.batch_decode(gen_ids, skip_special_tokens=True)
+            
+            # Explicit cleanup
+            del enc
+            del out_ids
 
         for q, gold_raw, gold_num, gen in zip(questions, gold_answers_raw, gold_nums, generations):
             strict_pred = extract_strict(gen)
@@ -209,8 +231,13 @@ def evaluate(
             end="\r",
             flush=True,
         )
+        
+        # GC and Cache clear every batch
+        gc.collect()
+        torch.cuda.empty_cache()
 
     print()
+
     elapsed = time.time() - t0
     return {
         "label": label,
@@ -261,19 +288,7 @@ def write_markdown(output_path: str, eval_results: list[dict], meta: dict):
         "- **Strict-match**: generation contains `#### <number>` and the number matches gold (commas/$ stripped).",
         "- **Flexible-extract**: last number found anywhere in the generation matches gold.",
         "",
-        "## WSD Training Curriculum (reference)",
-        "",
-        "| Phase | Block size | Steps |",
-        "|-------|-----------|-------|",
-        "| warmup_ar  | 1   | 500  |",
-        "| warmup_4   | 4   | 500  |",
-        "| warmup_32  | 32  | 500  |",
-        "| warmup_128 | 128 | 500  |",
-        "| stable     | 512 | 2000 |",
-        "| decay_64   | 64  | 300  |",
-        "| decay_32   | 32  | 200  |",
-        "",
-        "**Total**: 4500 optimizer steps · MiCA rank=16 α=16 targets=q_proj,v_proj · BF16",
+        "**Total optimizer steps**: 4500 · MiCA rank=16 α=16 targets=q_proj,v_proj · BF16",
     ]
 
     with open(output_path, "w") as f:
@@ -283,15 +298,25 @@ def write_markdown(output_path: str, eval_results: list[dict], meta: dict):
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument("--checkpoint",  default=DEFAULT_CHECKPOINT)
-    p.add_argument("--base_model",  default=DEFAULT_BASE_MODEL)
-    p.add_argument("--output",      default=DEFAULT_OUTPUT)
-    p.add_argument("--batch_size",  type=int, default=16)
+    p = argparse.ArgumentParser(description="GSM8K Accuracy Benchmark for MiCA-BD3LM")
+    p.add_argument("--checkpoint",  default=DEFAULT_CHECKPOINT,
+                   help=f"Path to the MiCA-BD3LM checkpoint directory (default: {DEFAULT_CHECKPOINT})")
+    p.add_argument("--base_model",  default=DEFAULT_BASE_MODEL,
+                   help=f"Path to the base AR model directory for comparison (default: {DEFAULT_BASE_MODEL})")
+    p.add_argument("--output",      default=DEFAULT_OUTPUT,
+                   help=f"Path to save the results report (.md and .json) (default: {DEFAULT_OUTPUT})")
+    p.add_argument("--batch_size",  type=int, default=16,
+                   help="Batch size for evaluation (default: 16)")
+    p.add_argument("--block_size",  type=int, default=1,
+                   help="Block size for BD3LM sampler (default: 1)")
+    p.add_argument("--steps_per_block", type=int, default=None,
+                   help="Fixed steps per block (overrides total steps budget)")
     p.add_argument("--skip_base",   action="store_true",
                    help="Skip evaluating the base Qwen3-0.6B baseline")
     p.add_argument("--limit",       type=int, default=None,
                    help="Evaluate on first N examples only (for quick tests)")
+    p.add_argument("--rank",        type=int, default=MICA_RANK)
+    p.add_argument("--alpha",       type=float, default=MICA_ALPHA)
     return p.parse_args()
 
 
@@ -305,7 +330,6 @@ def main():
     print(f"GPU  : {gpu.name}")
     print(f"VRAM : {gpu.total_memory / 1e9:.1f} GB")
 
-    # ── Dataset ───────────────────────────────────────────────────────────────
     print("\nLoading GSM8K ...")
     train_ds = load_dataset("gsm8k", "main", split="train")
     test_ds  = load_dataset("gsm8k", "main", split="test")
@@ -317,21 +341,22 @@ def main():
 
     all_results = []
 
-    # ── MiCA-BD3LM checkpoint ─────────────────────────────────────────────────
     print(f"\nLoading MiCA-BD3LM checkpoint: {args.checkpoint}")
     tokenizer = load_tokenizer(args.checkpoint)
-    mica_model = load_mica_model(args.checkpoint, device)
+    mica_model = load_mica_model(args.checkpoint, args.rank, args.alpha, device)
     total = sum(p.numel() for p in mica_model.parameters())
     trainable = sum(p.numel() for p in mica_model.parameters() if p.requires_grad)
     print(f"  params: {total:,}  trainable: {trainable:,} ({100*trainable/total:.3f}%)")
-    print("\nEvaluating MiCA-BD3LM ...")
+    print(f"\nEvaluating MiCA-BD3LM (block_size={args.block_size}, steps_per_block={args.steps_per_block}) ...")
     r = evaluate(mica_model, tokenizer, test_ds, fewshot_examples,
-                 args.batch_size, device, "MiCA-BD3LM (checkpoint-final)")
+                 args.batch_size, device, "MiCA-BD3LM (checkpoint-final)",
+                 block_size=args.block_size,
+                 steps_per_block=args.steps_per_block)
+
     all_results.append(r)
     del mica_model
     torch.cuda.empty_cache()
 
-    # ── Base model baseline ───────────────────────────────────────────────────
     if not args.skip_base:
         print(f"\nLoading base model: {args.base_model}")
         base_tok = load_tokenizer(args.base_model)
@@ -343,16 +368,12 @@ def main():
         del base_model
         torch.cuda.empty_cache()
 
-    # ── Save JSON + markdown ──────────────────────────────────────────────────
     json_path = args.output.replace(".md", ".json")
     Path(json_path).parent.mkdir(parents=True, exist_ok=True)
     with open(json_path, "w") as f:
-        # Omit per-sample generations from JSON to keep it small
-        json.dump(
-            [{k: v for k, v in r.items() if k != "results"} for r in all_results],
-            f, indent=2,
-        )
-    print(f"Summary JSON written to {json_path}")
+        json.dump(all_results, f, indent=2)
+    print(f"Detailed results JSON written to {json_path}")
+
 
     meta = {"checkpoint": args.checkpoint, "base_model": args.base_model}
     write_markdown(args.output, all_results, meta)

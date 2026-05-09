@@ -65,8 +65,9 @@ class DataArguments:
         },
     )
     text_field: str = field(default="text")
-    max_length: int = field(default=512, metadata={"help": "Tokens per training sequence."})
+    max_length: int = field(default=1024, metadata={"help": "Tokens per training sequence."})
     streaming: bool = field(default=True)
+    load_preprocessed_data: bool = field(default=False)
     num_proc: int = field(default=8, metadata={"help": "Workers for non-streaming map."})
     insert_eos: bool = field(default=True)
     drop_tail: bool = field(default=True)
@@ -74,8 +75,8 @@ class DataArguments:
 
 @dataclass
 class MiCAArguments:
-    mica_rank: int = field(default=16)
-    mica_alpha: float = field(default=16.0)
+    mica_rank: int = field(default=32)
+    mica_alpha: float = field(default=32.0)
     mica_targets: str = field(
         default="q_proj,v_proj",
         metadata={"help": "Comma-separated list of linear layer names to adapt."},
@@ -84,14 +85,14 @@ class MiCAArguments:
 
 @dataclass
 class TrainingArguments(BD3LMConfig):
-    output_dir: str = field(default="./outputs/mica-bd3lm")
+    output_dir: str = field(default="./outputs/mica-bd3lm-scaled")
 
     # Training budget
-    max_steps: int = field(default=4500)   # matches WSD total steps
+    max_steps: int = field(default=20000)   # Scale up for GSM8K
     learning_rate: float = field(default=1e-4)
-    per_device_train_batch_size: int = field(default=8)
-    per_device_eval_batch_size: int = field(default=8)
-    gradient_accumulation_steps: int = field(default=4)  # effective batch = 32
+    per_device_train_batch_size: int = field(default=4)
+    per_device_eval_batch_size: int = field(default=4)
+    gradient_accumulation_steps: int = field(default=8)  # effective batch = 32
     max_grad_norm: float = field(default=1.0)
     weight_decay: float = field(default=0.01)
 
@@ -101,27 +102,31 @@ class TrainingArguments(BD3LMConfig):
 
     # Precision & logging
     bf16: bool = field(default=True)
+    gradient_checkpointing: bool = field(default=True)
     logging_steps: int = field(default=10)
-    save_steps: int = field(default=500)
+    save_steps: int = field(default=1000)
     eval_strategy: str = field(default="steps")
-    eval_steps: int = field(default=200)
+    eval_steps: int = field(default=500)
     save_only_model: bool = field(default=True)
-    report_to: str = field(default="none")
+    report_to: str = field(default="wandb")
     overwrite_output_dir: bool = field(default=True)
     dataloader_num_workers: int = field(default=4)
+    resume_from_checkpoint: str = field(default=None)
 
     # BD3LM — initial block_size; WSD callback overrides this per-step
     block_size: int = field(default=1)
 
     # WSD curriculum
     use_wsd: bool = field(default=True)
-    wsd_warmup_ar_steps: int = field(default=500)
+    wsd_warmup_ar_steps: int = field(default=1000)
     wsd_warmup_4_steps: int = field(default=500)
     wsd_warmup_32_steps: int = field(default=500)
     wsd_warmup_128_steps: int = field(default=500)
-    wsd_stable_steps: int = field(default=2000)
-    wsd_decay_64_steps: int = field(default=300)
-    wsd_decay_32_steps: int = field(default=200)
+    wsd_warmup_512_steps: int = field(default=500)
+    wsd_stable_steps: int = field(default=15000)
+    wsd_decay_256_steps: int = field(default=1000)
+    wsd_decay_64_steps: int = field(default=500)
+    wsd_decay_32_steps: int = field(default=500)
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -165,8 +170,10 @@ def _build_wsd_scheduler(args: TrainingArguments) -> WSDBlockSizeScheduler:
         WSDPhase("warmup_4",   block_size=4,              steps=args.wsd_warmup_4_steps),
         WSDPhase("warmup_32",  block_size=32,             steps=args.wsd_warmup_32_steps),
         WSDPhase("warmup_128", block_size=128,            steps=args.wsd_warmup_128_steps),
-        WSDPhase("stable",     block_size=args.max_length if hasattr(args, "max_length") else 512,
+        WSDPhase("warmup_512", block_size=512,            steps=args.wsd_warmup_512_steps),
+        WSDPhase("stable",     block_size=args.max_length if hasattr(args, "max_length") else 1024,
                                steps=args.wsd_stable_steps),
+        WSDPhase("decay_256",  block_size=256,            steps=args.wsd_decay_256_steps),
         WSDPhase("decay_64",   block_size=64,             steps=args.wsd_decay_64_steps),
         WSDPhase("decay_32",   block_size=32,             steps=args.wsd_decay_32_steps),
     ])
@@ -198,35 +205,40 @@ def train():
     logger.info(f"Applying MiCA to {targets} ...")
     apply_mica(model, target_modules=targets, rank=mica_args.mica_rank, alpha=mica_args.mica_alpha)
 
+    if training_args.gradient_checkpointing:
+        model.enable_input_require_grads()
+
     total     = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f"Trainable: {trainable:,} / {total:,} ({100 * trainable / total:.3f}%)")
 
     # ── Dataset ───────────────────────────────────────────────────────────
-    logger.info(f"Loading dataset '{data_args.dataset_args}' (streaming={data_args.streaming}) ...")
+    logger.info(f"Loading dataset '{data_args.dataset_args}' (streaming={data_args.streaming}, preprocessed={data_args.load_preprocessed_data}) ...")
     dataset = dllm.data.load_pt_dataset(
         data_args.dataset_args,
         streaming=data_args.streaming,
+        load_preprocessed_data=data_args.load_preprocessed_data,
     )
 
-    tok_fn = functools.partial(
-        dllm.utils.tokenize_and_group,
-        tokenizer=tokenizer,
-        text_field=data_args.text_field,
-        seq_length=data_args.max_length,
-        insert_eos=data_args.insert_eos,
-        drop_tail=data_args.drop_tail,
-    )
-    map_kwargs = ({} if data_args.streaming else
-                  {"num_proc": data_args.num_proc, "desc": "Tokenizing"})
+    if not data_args.load_preprocessed_data:
+        tok_fn = functools.partial(
+            dllm.utils.tokenize_and_group,
+            tokenizer=tokenizer,
+            text_field=data_args.text_field,
+            seq_length=data_args.max_length,
+            insert_eos=data_args.insert_eos,
+            drop_tail=data_args.drop_tail,
+        )
+        map_kwargs = ({} if data_args.streaming else
+                      {"num_proc": data_args.num_proc, "desc": "Tokenizing"})
 
-    train_cols = dataset["train"].column_names
-    dataset = dataset.map(
-        tok_fn,
-        batched=True,
-        remove_columns=train_cols,
-        **map_kwargs,
-    )
+        train_cols = dataset["train"].column_names
+        dataset = dataset.map(
+            tok_fn,
+            batched=True,
+            remove_columns=train_cols,
+            **map_kwargs,
+        )
 
     if data_args.streaming:
         dataset["train"] = dataset["train"].shuffle(
@@ -235,6 +247,11 @@ def train():
 
     train_ds = dataset["train"]
     eval_ds  = dataset.get("test", None)
+    if eval_ds is None:
+        logger.info("No test split found. Disabling evaluation.")
+        training_args.eval_strategy = "no"
+        training_args.eval_steps = None
+    
     logger.info(f"Dataset ready.  eval_split={'yes' if eval_ds is not None else 'none'}")
 
     # ── WSD curriculum ────────────────────────────────────────────────────
@@ -262,7 +279,7 @@ def train():
         )
 
     logger.info("Starting training ...")
-    trainer.train()
+    trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
 
     final_dir = os.path.join(training_args.output_dir, "checkpoint-final")
     trainer.save_model(final_dir)

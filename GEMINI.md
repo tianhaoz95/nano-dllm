@@ -34,12 +34,42 @@ source .venv/bin/activate
 ```
 
 ### Training (Expected)
-Training will likely involve a custom script utilizing `BD3LMTrainer` and a new `MiCAConfig`.
+Training will involve a custom script utilizing `BD3LMTrainer` and a new `MiCAConfig`.
 *   **TODO:** Implement `MiCAConfig` and `MiCALinear` as PEFT adapters.
 *   **TODO:** Implement the WSD scheduler for block sizes.
 
+To ensure stability and prevent OOM on the Blackwell unified memory system, use `systemd-run` via `tsp` with strict memory limits:
+```bash
+tsp systemd-run --user --scope \
+    -p MemoryMax=100G \
+    -p MemorySwapMax=0 \
+    -p MemoryHigh=90G \
+    python scripts/train.py ...
+```
+*Rationale:* `MemoryMax` kills the process if it exceeds the limit, `MemorySwapMax=0` prevents performance degradation from swapping, and `MemoryHigh` triggers proactive reclamation at 90GB.
+
 ### Evaluation
-Use the `lm-evaluation-harness` integrated within `dllm_repo`.
+Use `scripts/benchmark_gsm8k.py` for performance tracking. 
+
+**Standard Benchmarking Protocol (Required for every major checkpoint):**
+1.  **Baseline Comparisons**:
+    *   **Base AR**: Run on the original `models/Qwen3-0.6B` using `benchmark_gsm8k.py` (Standard AR baseline).
+    *   **Zero-MiCA Implementation Check**: Run on the base model with **Zero-Initialized MiCA** adapters at `block_size=1`. The score **MUST** align with the Base AR model to verify no regressions in the sampler/model logic.
+2.  **BD3LM Scaling Analysis**:
+    *   **Block Sizes**: Benchmark at `block_size=1` (AR-like) and `block_size=8` (diffusion-like).
+    *   **Refinement Steps**: Benchmark at `steps_per_block=1` (Efficiency) and `steps_per_block=8` (Refinement Quality).
+
+**Execution Command:**
+```bash
+# Example for a specific configuration
+tsp systemd-run --user --scope -p MemoryMax=100G \
+    python scripts/benchmark_gsm8k.py \
+    --checkpoint outputs/your-run/checkpoint-final \
+    --block_size 8 \
+    --steps_per_block 1
+```
+*Note: Always use `tsp` and `systemd-run` to protect system memory integrity on the GB10.*
+
 
 ## 5. Development Conventions
 

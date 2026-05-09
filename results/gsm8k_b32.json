@@ -1,0 +1,11 @@
+[
+  {
+    "label": "MiCA-BD3LM (checkpoint-final)",
+    "n_examples": 64,
+    "strict_acc": 0.0,
+    "flex_acc": 0.0,
+    "strict_correct": 0,
+    "flex_correct": 0,
+    "elapsed_s": 127.03237533569336
+  }
+]

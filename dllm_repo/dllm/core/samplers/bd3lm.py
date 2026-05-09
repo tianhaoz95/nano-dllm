@@ -282,41 +282,99 @@ class BD3LMSampler(BaseSampler):
             # ------------------------------------------------------
             # 2.1) Prefix: prompt + all previous blocks
             # ------------------------------------------------------
-            x_prefix = x  # [B, T_prefix]
-            B_cur, T_prefix = x_prefix.shape
-
-            prefix_attn, prefix_pos = _prepare_for_sampling(
-                x=x_prefix,
-                block_size=block_size,
-                pad_token_id=pad_id,
-            )  # [B,1,T_prefix,T_prefix], [B,T_prefix]
-
-            # Conditional prefix cache + last logits
-            out_prefix = self.model(
-                x_prefix,
-                attention_mask=prefix_attn,
-                position_ids=prefix_pos,
-                use_cache=True,
-            )
-            cond_past = out_prefix.past_key_values
-            cond_prefix_last_logits = out_prefix.logits[:, -1:, :]  # [B, 1, V]
-
-            # Unconditional prefix cache + last logits (if CFG enabled)
-            if cfg_scale > 0.0:
-                un_x_prefix = x_prefix.clone()
-                un_x_prefix[unmasked_index] = mask_id
-
-                out_un_prefix = self.model(
-                    un_x_prefix,
+            # We want to update the cache incrementally to avoid O(T^2) and O(T*V) memory
+            if b_idx == 0:
+                # First block: process the entire padded prompt
+                x_prefix = x  # [B, T_prefix]
+                prefix_attn, prefix_pos = _prepare_for_sampling(
+                    x=x_prefix,
+                    block_size=block_size,
+                    pad_token_id=pad_id,
+                )
+                
+                # OPTIMIZATION: Use base model to avoid computing huge logits for the whole prefix
+                # hidden_states: [B, T_prefix, D]
+                out_prefix = self.model.model(
+                    x_prefix,
                     attention_mask=prefix_attn,
                     position_ids=prefix_pos,
                     use_cache=True,
                 )
-                uncond_past = out_un_prefix.past_key_values
-                uncond_prefix_last_logits = out_un_prefix.logits[:, -1:, :]  # [B, 1, V]
+                cond_past = out_prefix.past_key_values
+                
+                if right_shift_logits:
+                    # Only compute the last logit if needed
+                    last_hidden = out_prefix.last_hidden_state[:, -1:, :]
+                    cond_prefix_last_logits = self.model.lm_head(last_hidden).detach().clone()
+                else:
+                    cond_prefix_last_logits = None
+                
+                if cfg_scale > 0.0:
+                    un_x_prefix = x_prefix.clone()
+                    un_x_prefix[unmasked_index] = mask_id
+                    out_un_prefix = self.model.model(
+                        un_x_prefix,
+                        attention_mask=prefix_attn,
+                        position_ids=prefix_pos,
+                        use_cache=True,
+                    )
+                    uncond_past = out_un_prefix.past_key_values
+                    if right_shift_logits:
+                        un_last_hidden = out_un_prefix.last_hidden_state[:, -1:, :]
+                        uncond_prefix_last_logits = self.model.lm_head(un_last_hidden).detach().clone()
+                    else:
+                        uncond_prefix_last_logits = None
+                    del out_un_prefix
+                else:
+                    uncond_past = None
+                    uncond_prefix_last_logits = None
+                
+                del out_prefix
+
             else:
-                uncond_past = None
-                uncond_prefix_last_logits = None
+                # Subsequent blocks: incremental update using the last completed block
+                # The tokens in x[T_prefix-block_size : T_prefix] are now denoised
+                x_last_block = x[:, T_prefix - cur_block_len : T_prefix]
+                
+                # We need to compute the mask/pos for just this new segment
+                full_attn_inc, full_pos_inc = _prepare_for_sampling(
+                    x=x,
+                    block_size=block_size,
+                    pad_token_id=pad_id,
+                )
+                attn_inc = full_attn_inc[:, :, T_prefix - cur_block_len : T_prefix, :]
+                pos_inc = full_pos_inc[:, T_prefix - cur_block_len : T_prefix]
+
+                out_inc = self.model.model(
+                    x_last_block,
+                    attention_mask=attn_inc,
+                    position_ids=pos_inc,
+                    past_key_values=cond_past,
+                    use_cache=True,
+                )
+                cond_past = out_inc.past_key_values
+                
+                if right_shift_logits:
+                    last_hidden = out_inc.last_hidden_state[:, -1:, :]
+                    cond_prefix_last_logits = self.model.lm_head(last_hidden).detach().clone()
+
+                if cfg_scale > 0.0:
+                    un_x_last_block = x_last_block.clone()
+                    out_un_inc = self.model.model(
+                        un_x_last_block,
+                        attention_mask=attn_inc,
+                        position_ids=pos_inc,
+                        past_key_values=uncond_past,
+                        use_cache=True,
+                    )
+                    uncond_past = out_un_inc.past_key_values
+                    if right_shift_logits:
+                        un_last_hidden = out_un_inc.last_hidden_state[:, -1:, :]
+                        uncond_prefix_last_logits = self.model.lm_head(un_last_hidden).detach().clone()
+                    del out_un_inc
+                
+                del out_inc
+
 
             # ------------------------------------------------------
             # 2.2) Append new block of mask tokens to the right
@@ -372,29 +430,36 @@ class BD3LMSampler(BaseSampler):
                     break
 
                 # ---- Conditional logits for current block ----
-                cond_logits_block = self.model(
+                # We use a shallow copy or just the past_key_values because use_cache=False
+                # should prevent any in-place modification of the cache.
+                out_block = self.model.model(
                     x_block,
                     attention_mask=attn_block,
                     position_ids=pos_block,
-                    past_key_values=copy.deepcopy(cond_past),
+                    past_key_values=cond_past,
                     use_cache=False,
-                ).logits  # [B, cur_block_len, V]
-
+                )
+                cond_logits_block = self.model.lm_head(out_block.last_hidden_state) # [B, cur_block_len, V]
                 logits_block = cond_logits_block
 
                 # ---- Optional CFG ----
                 if cfg_scale > 0.0:
-                    un_logits_block = self.model(
+                    out_un_block = self.model.model(
                         x_block,
                         attention_mask=attn_block,
                         position_ids=pos_block,
-                        past_key_values=copy.deepcopy(uncond_past),
+                        past_key_values=uncond_past,
                         use_cache=False,
-                    ).logits  # [B, cur_block_len, V]
+                    )
+                    un_logits_block = self.model.lm_head(out_un_block.last_hidden_state) # [B, cur_block_len, V]
 
                     logits_block = un_logits_block + (cfg_scale + 1.0) * (
                         cond_logits_block - un_logits_block
                     )
+                    del out_un_block
+                
+                del out_block
+
 
                 # ---- Global AR-style right shift across blocks ----
                 if right_shift_logits:
