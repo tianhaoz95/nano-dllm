@@ -1,0 +1,60 @@
+site_name: nano-dllm Developer Docs
+site_description: Technical documentation for the nano-dllm project, focusing on MiCA-BD3LM training and optimization.
+repo_url: https://github.com/tianhaozhou95/nano-dllm
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: black
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.top
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+
+markdown_extensions:
+  - admonition
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.superfences
+  - pymdownx.arithmatex:
+      generic: true
+  - attr_list
+  - md_in_html
+
+extra_javascript:
+  - javascripts/mathjax.js
+  - https://polyfill.io/v3/polyfill.min.js?features=es6
+  - https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js
+
+nav:
+  - Overview: index.md
+  - Architecture:
+      - MiCA PEFT: architecture/mica.md
+      - BD3LM Diffusion: architecture/bd3lm.md
+      - WSD Curriculum: architecture/wsd.md
+  - Training:
+      - Training Guide: training/guide.md
+      - Memory Optimizations: training/optimizations.md
+  - Benchmarking:
+      - GSM8K Protocol: benchmarking/gsm8k.md
+  - Operations:
+      - Resource Management: operations/resources.md
