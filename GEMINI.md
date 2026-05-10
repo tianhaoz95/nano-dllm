@@ -33,18 +33,21 @@ The project relies on the `dLLM` library. Key components include:
 source .venv/bin/activate
 ```
 
-### Training (Expected)
-Training will involve a custom script utilizing `BD3LMTrainer` and a new `MiCAConfig`.
-*   **TODO:** Implement `MiCAConfig` and `MiCALinear` as PEFT adapters.
-*   **TODO:** Implement the WSD scheduler for block sizes.
+### Training
+Training utilizes the `BD3LMTrainer` with `MiCALinear` PEFT adapters and the WSD block-size curriculum.
 
-To ensure stability and prevent OOM on the Blackwell unified memory system, use `systemd-run` via `tsp` with strict memory limits:
+To ensure stability and prevent OOM on the Blackwell unified memory system, use `systemd-run` via `tsp` with strict memory limits. **Important:** Always set `WANDB_PROJECT=nano-dllm` to ensure metrics are logged to the correct project and use the virtual environment's python.
+
 ```bash
-tsp systemd-run --user --scope \
+# Example for resuming training
+WANDB_PROJECT=nano-dllm tsp systemd-run --user --scope \
     -p MemoryMax=100G \
     -p MemorySwapMax=0 \
     -p MemoryHigh=90G \
-    python scripts/train.py ...
+    ./.venv/bin/python scripts/train.py \
+    --output_dir ./outputs/mica-bd3lm-gsm8k-scaled \
+    --resume_from_checkpoint ./outputs/mica-bd3lm-gsm8k-scaled/checkpoint-2000 \
+    --mica_rank 32
 ```
 *Rationale:* `MemoryMax` kills the process if it exceeds the limit, `MemorySwapMax=0` prevents performance degradation from swapping, and `MemoryHigh` triggers proactive reclamation at 90GB.
 

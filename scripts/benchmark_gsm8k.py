@@ -200,11 +200,12 @@ def run_automated_benchmark(
     device: str = "cuda",
 ):
     """
-    Runs the 4-part benchmark requested:
+    Runs the 5-part benchmark requested:
     1. Base AR
-    2. Block Size 8 + Zero MiCA
-    3. Block Size 1 + Trained MiCA
-    4. Block Size 8 + Trained MiCA
+    2. Block Size 8 + Zero MiCA (Untrained)
+    3. Block Size 1 + Zero MiCA (Untrained)
+    4. Block Size 1 + Trained MiCA
+    5. Block Size 8 + Trained MiCA
     """
     print(f"\n[GSMBench] Starting automated benchmark for {checkpoint_path} (limit={limit})")
     
@@ -223,7 +224,7 @@ def run_automated_benchmark(
     del model
     torch.cuda.empty_cache()
 
-    # 2. Block Size 8 + Zero MiCA
+    # 2. Block Size 8 + Zero MiCA (Untrained)
     print("  Evaluating Configuration 2: BS=8 + Zero MiCA ...")
     model = load_mica_model(checkpoint_path, rank, alpha, device, zero_mica=True)
     r = evaluate(model, tokenizer, test_ds, fewshot_examples, batch_size, device, "BS8-ZeroMiCA", block_size=8)
@@ -231,12 +232,22 @@ def run_automated_benchmark(
     del model
     torch.cuda.empty_cache()
 
-    # 3. Block Size 1 + Trained MiCA
-    print("  Evaluating Configuration 3: BS=1 + Trained MiCA ...")
+    # 3. Block Size 1 + Zero MiCA (Untrained)
+    print("  Evaluating Configuration 3: BS=1 + Zero MiCA ...")
+    model = load_mica_model(checkpoint_path, rank, alpha, device, zero_mica=True)
+    r = evaluate(model, tokenizer, test_ds, fewshot_examples, batch_size, device, "BS1-ZeroMiCA", block_size=1)
+    results["gsm8k/bs1_zero_mica_acc"] = r["strict_acc"]
+    del model
+    torch.cuda.empty_cache()
+
+    # 4. Block Size 1 + Trained MiCA
+    print("  Evaluating Configuration 4: BS=1 + Trained MiCA ...")
     model = load_mica_model(checkpoint_path, rank, alpha, device, zero_mica=False)
     r = evaluate(model, tokenizer, test_ds, fewshot_examples, batch_size, device, "BS1-TrainedMiCA", block_size=1)
     results["gsm8k/bs1_trained_mica_acc"] = r["strict_acc"]
-    # Keep model for next config to save load time if possible, but here we change block size which is a sampler param
+    
+    # 5. Block Size 8 + Trained MiCA
+    print("  Evaluating Configuration 5: BS=8 + Trained MiCA ...")
     r = evaluate(model, tokenizer, test_ds, fewshot_examples, batch_size, device, "BS8-TrainedMiCA", block_size=8)
     results["gsm8k/bs8_trained_mica_acc"] = r["strict_acc"]
     
